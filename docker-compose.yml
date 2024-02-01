@@ -12,6 +12,7 @@ services:
     hostname: zookeeper
     # Rather than a default name for the container a custom container name is defined
     container_name: zookeeper
+    # In this section you map ports form the host machine to the container
     ports:
       # host:container. Port 2181 in the host machine will be forwarded to port 2181 inside the zookeeper container
       - "2181:2181"
@@ -34,18 +35,25 @@ services:
     image: confluentinc/cp-server:7.4.0
     hostname: broker
     container_name: broker
+    # Expresses startup and shutdown dependencies between services
     depends_on:
       zookeeper:
         condition: service_healthy
     ports:
       - "9092:9092"
+      # Used for JMX (Java Management Extensions) monitoring of the Kafka broker.
       - "9101:9101"
     environment:
+      # Configuration: https://docs.confluent.io/platform/current/installation/configuration/broker-configs.html
+      # https://docs.confluent.io/platform/current/installation/docker/config-reference.html: "Prefix Kafka component properties with KAFKA_"
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # In this case "securityProtocol://IP:port". Specifying how kafka brokers advertises to clients.
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:29092,PLAINTEXT_HOST://localhost:9092
+      # Mapping security protocol PLAINTEXT & PLAINTEXT_HOST to PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_METRIC_REPORTERS: io.confluent.metrics.reporter.ConfluentMetricsReporter
+      # Its default value is 3 and if we don’t do that, we will get into this error: "...InvalidReplicationFactorException: Replication factor: 3 larger than available brokers: 1"
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
       KAFKA_CONFLUENT_LICENSE_TOPIC_REPLICATION_FACTOR: 1
@@ -55,6 +63,8 @@ services:
       KAFKA_JMX_PORT: 9101
       KAFKA_JMX_HOSTNAME: localhost
       KAFKA_CONFLUENT_SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      # https://docs.confluent.io/platform/current/kafka/metrics-reporter.html#configuration-options
+      # https://docs.confluent.io/platform/current/installation/docker/config-reference.html: "Prefix Confluent component properties for cp-server with CONFLUENT_"
       CONFLUENT_METRICS_REPORTER_BOOTSTRAP_SERVERS: broker:29092
       CONFLUENT_METRICS_REPORTER_TOPIC_REPLICAS: 1
       CONFLUENT_METRICS_ENABLE: 'false'
@@ -77,6 +87,7 @@ services:
     ports:
       - "8081:8081"
     environment:
+      # https://docs.confluent.io/platform/current/schema-registry/installation/config.html#schemaregistry-config
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: 'broker:29092'
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
@@ -100,13 +111,14 @@ services:
     ports:
       - "9021:9021"
     environment:
+      # https://docs.confluent.io/platform/current/control-center/installation/configuration.html
       CONTROL_CENTER_BOOTSTRAP_SERVERS: 'broker:29092'
       CONTROL_CENTER_SCHEMA_REGISTRY_URL: "http://schema-registry:8081"
       CONTROL_CENTER_REPLICATION_FACTOR: 1
       CONTROL_CENTER_INTERNAL_TOPICS_PARTITIONS: 1
       CONTROL_CENTER_MONITORING_INTERCEPTOR_TOPIC_PARTITIONS: 1
       CONFLUENT_METRICS_TOPIC_REPLICATION: 1
-      CONFLIENT_METRICS_ENABLE: 'false'
+      CONFLUENT_METRICS_ENABLE: 'false'
       PORT: 9021
     networks:
       - confluent
@@ -116,37 +128,51 @@ services:
       timeout: 10s
       retries: 5
 
+  # PHASE 2: Airflow Webserver, Airflow Scheduler and Postgres DB
+
   webserver:
     image: apache/airflow:2.6.0-python3.9
+    # Specifies the default command to run when the container starts.
     command: webserver
+    # Specifies the default executable to run when the container starts. This overrides the ENTRYPOINT instruction from the service's Dockerfile.
     entrypoint: ['/opt/airflow/entrypoint.sh']
+    container_name: airflow_webserver
+    ports:
+      - "8080:8080"
     depends_on:
       - postgres
     environment:
-      - LOAD_EX=n
-      - EXECUTOR=Sequential
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
+      # https://airflow.apache.org/docs/apache-airflow/stable/configurations-ref.html
+      - LOAD_EX=n # AIRFLOW__CORE__LOAD_EXAMPLES = False
+      - EXECUTOR=Sequential # AIRFLOW__CORE__EXECUTOR = SequentialExecutor
+      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow # postgresql+psycopg2://<user>:<password>@<host>/<db>
       - AIRFLOW_WEBSERVER_SECRET_KEY=this_is_a_very_secured_key
+    # Defines the logging configuration for the service.
     logging:
+      # https://docs.docker.com/config/containers/logging/configure/
       options:
         max-size: 10m
         max-file: "3"
+    # Define mount host paths or named volumes that are accessible by service containers
+    # https://docs.docker.com/compose/compose-file/07-volumes/
     volumes:
       - ./dags:/opt/airflow/dags
       - ./script/entrypoint.sh:/opt/airflow/entrypoint.sh
       - ./requirements.txt:/opt/airflow/requirements.txt
-    ports:
-      - "8080:8080"
     healthcheck:
       test: ['CMD-SHELL', "[ -f /opt/airflow/airflow-webserver.pid ]"]
       interval: 30s
+      #Review timeout policies
       timeout: 30s
-      retries: 3
+      # Webserver is the component that takes longer to start
+      retries: 10
     networks:
       - confluent
 
   scheduler:
     image: apache/airflow:2.6.0-python3.9
+    container_name: airflow_scheduler
+    command: bash -c "pip install -r ./requirements.txt && airflow db upgrade && airflow scheduler"
     depends_on:
       webserver:
         condition: service_healthy
@@ -155,17 +181,21 @@ services:
       - ./script/entrypoint.sh:/opt/airflow/script/entrypoint.sh
       - ./requirements.txt:/opt/airflow/requirements.txt
     environment:
+      # Same environment parameters as in the webserver
       - LOAD_EX=n
       - EXECUTOR=Sequential
       - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:airflow@postgres:5432/airflow
       - AIRFLOW_WEBSERVER_SECRET_KEY=this_is_a_very_secured_key
-    command: bash -c "pip install -r ./requirements.txt && airflow db upgrade && airflow scheduler"
     networks:
       - confluent
 
   postgres:
     image: postgres:14.0
+    container_name: postgresDB
+    ports:
+      - '5432:5432'
     environment:
+      # https://www.docker.com/blog/how-to-use-the-postgres-docker-official-image/
       - POSTGRES_USER=airflow
       - POSTGRES_PASSWORD=airflow
       - POSTGRES_DB=airflow
@@ -175,6 +205,8 @@ services:
         max-file: "3"
     networks:
       - confluent
+
+  # PHASE 3: Spark-master, spark-worker & cassandraDB
 
   spark-master:
     image: bitnami/spark:latest
